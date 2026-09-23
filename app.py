@@ -104,6 +104,7 @@ class UpstoxClient:
             raise RuntimeError(str(payload)[:500])
         return payload
 
+    @staticmethod
     @st.cache_data(ttl=3600, show_spinner=False)
     def instrument_master_cached(_token: str) -> pd.DataFrame:
         r = requests.get(MASTER_URL, timeout=60)
