@@ -141,6 +141,14 @@ class UpstoxClient:
         )
 
     def full_quotes(self, keys: list[str]) -> dict:
+        """Fetch V3 full quotes and index them by every useful identifier.
+
+        Important: Upstox V3 returns the `data` object keyed as
+        `NSE_EQ:TRADING_SYMBOL`, while the instrument master uses
+        `NSE_EQ|ISIN` as `instrument_key`.  The previous implementation
+        looked up only the instrument-master key, so every NSE equity quote
+        was missed and the scanner produced zero candidates.
+        """
         result = {}
         for i in range(0, len(keys), QUOTE_BATCH):
             batch = keys[i:i + QUOTE_BATCH]
@@ -148,7 +156,20 @@ class UpstoxClient:
                 "/market-quote/quotes",
                 {"instrument_key": ",".join(batch)},
             )
-            result.update(payload.get("data", {}))
+            data = payload.get("data", {}) or {}
+            for response_key, item in data.items():
+                if not isinstance(item, dict):
+                    continue
+                # Keep the API response key.
+                result[str(response_key)] = item
+                # Also index by the instrument key returned by Upstox.
+                instrument_token = item.get("instrument_token")
+                if instrument_token:
+                    result[str(instrument_token)] = item
+                # And by the normalized exchange:symbol form.
+                symbol = item.get("symbol")
+                if symbol:
+                    result[f"NSE_EQ:{symbol}"] = item
         return result
 
     def ohlc(self, keys: list[str]) -> dict:
@@ -269,10 +290,19 @@ def live_prefilter(client: UpstoxClient, universe: pd.DataFrame, limit: int):
     keys = universe.instrument_key.astype(str).tolist()
     quotes = client.full_quotes(keys)
     candidates = []
+    matched_quotes = 0
 
     for row in universe.itertuples(index=False):
         key = str(row.instrument_key)
         q = client.quote_item(quotes, key)
+        # V3 equity quotes are normally keyed by NSE_EQ:SYMBOL, not
+        # NSE_EQ|ISIN. Fall back to the trading symbol explicitly.
+        if not q:
+            symbol = str(getattr(row, "trading_symbol", ""))
+            if symbol:
+                q = client.quote_item(quotes, f"NSE_EQ:{symbol}")
+        if q:
+            matched_quotes += 1
         price, volume, _ = client.quote_fields(q)
         if price is None:
             continue
@@ -574,6 +604,8 @@ if "scan_results" not in st.session_state:
     st.session_state.scan_results = pd.DataFrame()
 if "scan_time" not in st.session_state:
     st.session_state.scan_time = None
+if "scan_completed" not in st.session_state:
+    st.session_state.scan_completed = False
 if "universe" not in st.session_state:
     st.session_state.universe = None
 if "market" not in st.session_state:
@@ -632,6 +664,7 @@ if scan_clicked:
                 client, universe, int(candidate_limit)
             )
             st.session_state.scan_time = datetime.now()
+            st.session_state.scan_completed = True
         except Exception as exc:
             st.error(f"Scan failed: {exc}")
 
@@ -653,7 +686,13 @@ page = st.segmented_control(
 )
 
 if df.empty:
-    st.info("Tap **LIVE FULL SCAN** to populate current setups.")
+    if st.session_state.scan_completed:
+        st.warning(
+            "Scan completed but no qualifying setup was returned. "
+            "The next scan will show the live-quote match count and errors if any."
+        )
+    else:
+        st.info("Tap **LIVE FULL SCAN** to populate current setups.")
 else:
     if page == "Dashboard":
         counts = {
